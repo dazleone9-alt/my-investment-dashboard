@@ -4,146 +4,125 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
 
 # --- 页面配置 ---
-st.set_page_config(page_title="量化动量选股神器", layout="wide")
+st.set_page_config(page_title="多因子量化选股平台", layout="wide")
 
 # --- 侧边栏：策略配置 ---
-st.sidebar.header("🧠 量化策略配置")
+st.sidebar.header("🧠 策略中控台")
 
-# 1. 定义股票池 (这里预设了一些热门科技股和行业ETF，你可以随意修改)
-default_pool = """AAPL, MSFT, NVDA, TSLA, GOOG, AMZN, META, NFLX, AMD, INTC, 
-XLK, XLV, XLF, XLE, GLD, VOO, QQQ, SMH, ARKK, COIN"""
+# 1. 策略选择 (新增功能)
+strategy_type = st.sidebar.radio(
+    "1. 请选择你的战术🎯",
+    ("进攻型：动量策略 (Momentum)", "防守型：低波策略 (Low Volatility)")
+)
 
-st.sidebar.subheader("1. 候选股票池 (Ticker Pool)")
-tickers_input = st.sidebar.text_area("输入备选代码 (逗号分隔)", default_pool, height=150)
+# 2. 股票池
+default_pool = """AAPL, MSFT, NVDA, TSLA, GOOG, AMZN, META, NFLX, AMD, 
+XLK, XLV, XLF, XLE, GLD, VOO, QQQ, SMH, JNJ, PG, KO, PEP, MCD, V, MA"""
+st.sidebar.subheader("2. 股票池")
+tickers_input = st.sidebar.text_area("输入代码 (逗号分隔)", default_pool, height=100)
 
-# 2. 策略参数
-st.sidebar.subheader("2. 选股逻辑")
-lookback_days = st.sidebar.selectbox("按过去多久的收益率排名?", 
-                                     options=[30, 90, 180, 365, 730], 
-                                     index=2, 
-                                     format_func=lambda x: f"过去 {x} 天")
+# 3. 参数
+st.sidebar.subheader("3. 参数设置")
+lookback_days = st.sidebar.selectbox("回测周期", [30, 90, 180, 365], index=2, format_func=lambda x: f"过去 {x} 天")
+top_n = st.sidebar.slider("选出几只股票?", 1, 10, 5)
+initial_capital = st.sidebar.number_input("虚拟本金", value=100000)
 
-top_n = st.sidebar.slider("只持有排名前几名?", 1, 10, 5)
-
-initial_capital = st.sidebar.number_input("虚拟本金 ($)", value=100000)
-
-# --- 核心函数 ---
+# --- 核心逻辑 ---
 @st.cache_data
 def get_data(tickers):
-    # 下载足够长的数据以计算动量
     data = yf.download(tickers, period="2y", progress=False)['Close']
     return data
 
-# --- 主逻辑 ---
 try:
-    # 1. 清洗输入
-    pool = [x.strip().upper() for x in tickers_input.split(',') if x.strip() != '']
-    pool = list(set(pool)) # 去重
+    pool = [x.strip().upper() for x in tickers_input.split(',') if x.strip()]
+    pool = list(set(pool))
     
-    if len(pool) < top_n:
-        st.error(f"股票池里的数量 ({len(pool)}) 少于你要选的数量 ({top_n})，请多加点股票！")
-        st.stop()
-
-    # 2. 获取数据
-    with st.spinner('正在扫描市场数据，寻找最强王者...'):
+    with st.spinner('正在量化计算中...'):
         df = get_data(pool)
     
     if df is None or df.empty:
-        st.error("无法获取数据，请检查代码或网络。")
+        st.error("数据获取失败")
         st.stop()
         
-    # 清洗：去掉全是空值的列，并向前填充
     df = df.dropna(axis=1, how='all').ffill()
     
-    # 3. 计算动量 (Momentum Ranking)
-    # 计算“回测周期”前的价格。如果数据不够长，就取第一天。
-    start_date_idx = -1 * lookback_days
-    if abs(start_date_idx) > len(df):
-        start_date_idx = 0
+    # 确定计算的起止时间
+    start_idx = -1 * lookback_days
+    if abs(start_idx) > len(df): start_idx = 0
+    
+    subset = df.iloc[start_idx:]
+    
+    # --- 策略分流核心代码 ---
+    
+    if "进攻型" in strategy_type:
+        # 策略 A：动量 (计算区间涨幅)
+        metric_name = "区间涨幅"
+        start_price = subset.iloc[0]
+        end_price = subset.iloc[-1]
+        scores = (end_price - start_price) / start_price
+        # 涨幅越大越好 -> 降序排列
+        top_picks = scores.sort_values(ascending=False).head(top_n)
+        st.success(f"🚀 当前策略逻辑：寻找过去 {lookback_days} 天涨势最猛的 {top_n} 只股票 (强者恒强)")
         
-    current_prices = df.iloc[-1]
-    past_prices = df.iloc[start_date_idx]
-    
-    # 计算区间收益率
-    momentum_returns = (current_prices - past_prices) / past_prices
-    
-    # 4. 排序并选出 Top N
-    # ascending=False 表示从高到低排
-    ranked_assets = momentum_returns.sort_values(ascending=False)
-    top_picks = ranked_assets.head(top_n)
-    
-    # 获取赢家的代码
+    else:
+        # 策略 B：低波动 (计算标准差/波动率)
+        metric_name = "波动率 (越低越稳)"
+        # 计算日收益率
+        daily_returns = subset.pct_change().dropna()
+        # 计算波动率 (标准差)
+        scores = daily_returns.std()
+        # 波动越小越好 -> 升序排列
+        top_picks = scores.sort_values(ascending=True).head(top_n)
+        st.info(f"🛡️ 当前策略逻辑：寻找过去 {lookback_days} 天震荡最小的 {top_n} 只股票 (避险抗跌)")
+
+    # --- 展示结果 ---
     winner_tickers = top_picks.index.tolist()
+    
+    # 图表数据准备
+    winner_data = subset[winner_tickers]
+    normalized = winner_data / winner_data.iloc[0]
+    portfolio_curve = normalized.mean(axis=1)
 
-    # --- 仪表盘展示 ---
+    # 布局
+    st.title(f"策略分析报告：{strategy_type.split('：')[0]}")
     
-    st.title(f"🏆 动量优选策略 (基于过去 {lookback_days} 天表现)")
+    col_table, col_chart = st.columns([1, 2])
     
-    # 展示排名表格
-    st.subheader(f"📊 表现最强的 {top_n} 只标的")
-    
-    # 美化表格显示
-    display_df = pd.DataFrame({'代码': top_picks.index, '区间涨幅': top_picks.values})
-    display_df['区间涨幅'] = display_df['区间涨幅'].apply(lambda x: f"{x:.2%}")
-    
-    # 颜色高亮
-    col_rank, col_chart = st.columns([1, 2])
-    
-    with col_rank:
+    with col_table:
+        st.subheader("选股结果")
+        display_df = pd.DataFrame({'代码': top_picks.index, metric_name: top_picks.values})
+        # 格式化数字
+        if "进攻" in strategy_type:
+            display_df[metric_name] = display_df[metric_name].apply(lambda x: f"+{x:.2%}")
+        else:
+            display_df[metric_name] = display_df[metric_name].apply(lambda x: f"{x:.4f}")
+            
         st.table(display_df)
-        st.success(f"系统建议当前持有：{', '.join(winner_tickers)}")
-
-    # 5. 模拟组合表现 (假设在过去N天持有这几只最好的)
-    # 注意：这是一个“事后诸葛亮”视角，展示的是这些赢家是怎么跑出来的
-    winner_data = df[winner_tickers].iloc[start_date_idx:]
-    
-    # 归一化处理：假设起点都是 1
-    normalized_growth = winner_data / winner_data.iloc[0]
-    
-    # 计算组合平均走势 (等权重持有)
-    portfolio_curve = normalized_growth.mean(axis=1)
-    
+        
     with col_chart:
         fig = go.Figure()
-        # 画个股的细线
-        for ticker in winner_tickers:
-            fig.add_trace(go.Scatter(x=normalized_growth.index, y=normalized_growth[ticker], 
-                                     mode='lines', name=ticker, opacity=0.5, line=dict(width=1)))
-        
-        # 画组合的粗线
-        fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve, 
-                                 mode='lines', name='优选组合 (平均)', 
-                                 line=dict(color='red', width=4)))
-        
-        fig.update_layout(title="赢家组合走势回顾", yaxis_title="净值增长 (1 = 起点)", height=400)
+        for t in winner_tickers:
+            fig.add_trace(go.Scatter(x=normalized.index, y=normalized[t], mode='lines', name=t, opacity=0.3))
+        fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve, mode='lines', name='组合净值', line=dict(color='red', width=3)))
+        fig.update_layout(title="组合回测走势 (归一化)", yaxis_title="净值", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
-    # 6. 具体持仓建议
+    # 调仓建议
     st.markdown("---")
-    st.subheader("💰 建议调仓方案")
+    st.subheader("💰 调仓指令")
+    money_per = initial_capital / top_n
+    latest_p = df[winner_tickers].iloc[-1]
     
-    # 假设等权重买入
-    weight_per_stock = 1.0 / top_n
-    money_per_stock = initial_capital * weight_per_stock
-    
-    suggested_shares = []
-    latest_prices = df[winner_tickers].iloc[-1]
-    
-    for ticker in winner_tickers:
-        price = latest_prices[ticker]
-        shares = money_per_stock / price
-        suggested_shares.append({
-            '代码': ticker,
-            '当前价格': f"${price:.2f}",
-            '分配金额': f"${money_per_stock:,.0f}",
-            '建议买入股数': f"{shares:.2f} 股"
+    buy_list = []
+    for t in winner_tickers:
+        buy_list.append({
+            '标的': t,
+            '最新价': f"${latest_p[t]:.2f}",
+            '建议买入': f"{money_per/latest_p[t]:.2f} 股"
         })
-        
-    st.dataframe(pd.DataFrame(suggested_shares))
+    st.dataframe(pd.DataFrame(buy_list), use_container_width=True)
 
 except Exception as e:
-    st.error(f"发生错误: {e}")
-    st.info("提示：如果股票池太大，可能会导致Yahoo API超时，请尝试减少一些备选股票。")
+    st.error(f"出错: {e}")
