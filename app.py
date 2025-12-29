@@ -4,205 +4,232 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from datetime import datetime
 
 # --- 页面配置 ---
-st.set_page_config(page_title="全能多因子量化工作台", layout="wide")
+st.set_page_config(page_title="AlphaCopilot v6.0", layout="wide", page_icon="📈")
 
-# --- 侧边栏：因子工厂 ---
-st.sidebar.header("🎛️ 因子选股工厂")
-
-# 1. 策略选择
-strategy_map = {
-    "🔥 动量因子 (Momentum)": "寻找强势股 (强者恒强)",
-    "🛡️ 低波因子 (Low Volatility)": "寻找稳健股 (抗跌防御)",
-    "🎯 高贝塔因子 (High Beta)": "寻找高弹性股 (牛市急先锋)",
-    "🐢 低贝塔因子 (Low Beta)": "寻找低相关股 (熊市避风港)",
-    "💰 流动性因子 (Liquidity)": "寻找资金拥挤股 (热门成交)",
-    "🎣 反转因子 (RSI Reversal)": "寻找超卖股 (短线抄底)"
-}
-
-selected_strategy = st.sidebar.selectbox("1. 选择选股因子", list(strategy_map.keys()))
-st.sidebar.info(f"策略逻辑：{strategy_map[selected_strategy]}")
-
-# 2. 股票池
-default_pool = """AAPL, MSFT, NVDA, TSLA, GOOG, AMZN, META, NFLX, AMD, INTC,
-XLK, XLV, XLF, XLE, GLD, VOO, QQQ, SMH, ARKK, COIN,
-JPM, BAC, WMT, COST, KO, PEP, JNJ, PFE, XOM, CVX"""
-
-st.sidebar.subheader("2. 股票池配置")
-tickers_input = st.sidebar.text_area("输入股票池 (逗号分隔)", default_pool, height=120)
-
-# 3. 参数设置
-st.sidebar.subheader("3. 回测参数")
-lookback_days = st.sidebar.slider("计算周期 (天)", 30, 365, 90)
-top_n = st.sidebar.slider("优选数量", 1, 10, 5)
-initial_capital = st.sidebar.number_input("虚拟本金", value=100000)
-
-# --- 核心计算函数 ---
+# --- 全局函数 ---
 @st.cache_data
-def get_data(tickers):
-    # 多下载一些数据用于计算技术指标，并必须包含 SPY 作为市场基准
-    all_tickers = list(set(tickers + ['SPY']))
-    data = yf.download(all_tickers, period="2y", group_by='ticker', progress=False)
-    return data
-
-def calculate_beta(stock_returns, market_returns):
-    # 计算 Beta: Cov(s, m) / Var(m)
-    covariance = np.cov(stock_returns, market_returns)[0][1]
-    variance = np.var(market_returns)
-    return covariance / variance if variance != 0 else 0
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-# --- 主逻辑 ---
-try:
-    pool = [x.strip().upper() for x in tickers_input.split(',') if x.strip()]
+def get_data(tickers, period="2y"):
+    if not tickers: return None
+    # 自动去重并大写
+    tickers = list(set([t.upper().strip() for t in tickers]))
+    # 必须加入基准
+    if 'SPY' not in tickers: tickers.append('SPY')
+    if 'QQQ' not in tickers: tickers.append('QQQ')
     
-    if len(pool) < top_n:
-        st.error("股票池数量太少，无法选股！")
-        st.stop()
+    try:
+        data = yf.download(tickers, period=period, group_by='ticker', progress=False)
+        return data
+    except Exception as e:
+        return None
+
+def calculate_metrics(daily_returns):
+    if daily_returns.empty: return 0,0,0,0
+    cagr = (1 + daily_returns.mean()) ** 252 - 1
+    vol = daily_returns.std() * np.sqrt(252)
+    sharpe = (cagr - 0.04) / vol if vol != 0 else 0
+    cum_ret = (1 + daily_returns).cumprod()
+    max_dd = ((cum_ret / cum_ret.expanding().max()) - 1).min()
+    return cagr, vol, sharpe, max_dd
+
+# --- 主界面 ---
+st.title("📈 AlphaCopilot 个人量化指挥舱")
+
+# 使用 Tab 分隔不同功能区
+tab1, tab2 = st.tabs(["💼 我的持仓 (Portfolio)", "🔍 市场扫描 (Scanner)"])
+
+# ==========================================
+# TAB 1: 我的持仓管理 (满足需求 2,3,4,5,6,7)
+# ==========================================
+with tab1:
+    st.sidebar.header("💼 持仓配置")
+    
+    # 1. 持仓输入
+    default_pos = "NVDA:30, AAPL:20, MSFT:20, TSLA:15, COIN:15"
+    pos_input = st.sidebar.text_area("输入持仓 (格式: 代码:比例)", default_pos, height=100)
+    capital = st.sidebar.number_input("总资金 ($)", 100000, key="cap1")
+    
+    # 解析持仓
+    try:
+        portfolio_dict = {}
+        for item in pos_input.split(','):
+            k, v = item.split(':')
+            portfolio_dict[k.strip().upper()] = float(v)
         
-    with st.spinner('正在进行多因子量化运算...'):
-        # 获取 OHLCV 数据
-        raw_data = get_data(pool)
-    
-    if raw_data is None or raw_data.empty:
-        st.error("数据获取失败。")
-        st.stop()
-
-    # 提取 Close 和 Volume
-    # yfinance multi-level columns 处理
-    close_df = pd.DataFrame()
-    volume_df = pd.DataFrame()
-    
-    for t in raw_data.columns.levels[0]:
-        if 'Close' in raw_data[t]:
-            close_df[t] = raw_data[t]['Close']
-        if 'Volume' in raw_data[t]:
-            volume_df[t] = raw_data[t]['Volume']
-            
-    close_df = close_df.ffill().dropna(axis=1, how='all')
-    
-    # 截取回测时间段
-    start_idx = -1 * lookback_days
-    if abs(start_idx) > len(close_df): start_idx = 0
-    subset = close_df.iloc[start_idx:]
-    
-    # 准备基准数据 (SPY)
-    spy_returns = subset['SPY'].pct_change().dropna() if 'SPY' in subset else None
-    
-    # --- 因子计算引擎 ---
-    scores = {}
-    
-    # 排除 SPY 自身参与排名
-    ranking_pool = [t for t in pool if t in subset.columns and t != 'SPY']
-    
-    for ticker in ranking_pool:
-        series = subset[ticker]
-        daily_ret = series.pct_change().dropna()
+        # 归一化权重
+        total_w = sum(portfolio_dict.values())
+        weights = {k: v/total_w for k, v in portfolio_dict.items()}
+        tickers = list(weights.keys())
         
-        if "动量" in selected_strategy:
-            # 动量：区间涨幅
-            scores[ticker] = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
-            ascending_order = False # 越大越好
-            col_name = "区间涨幅"
-            fmt = "{:.2%}"
+        # 获取数据
+        raw_data = get_data(tickers)
+        
+        if raw_data is not None:
+            # 提取收盘价
+            close_df = pd.DataFrame()
+            for t in raw_data.columns.levels[0]:
+                if 'Close' in raw_data[t]:
+                    close_df[t] = raw_data[t]['Close']
+            close_df = close_df.ffill().dropna()
             
-        elif "低波" in selected_strategy:
-            # 波动率：标准差
-            scores[ticker] = daily_ret.std() * np.sqrt(252)
-            ascending_order = True # 越小越好
-            col_name = "年化波动率"
-            fmt = "{:.2%}"
+            # 计算收益
+            returns = close_df.pct_change().dropna()
             
-        elif "贝塔" in selected_strategy:
-            # Beta 计算
-            if spy_returns is not None:
-                # 对齐数据长度
-                common_idx = daily_ret.index.intersection(spy_returns.index)
-                beta = calculate_beta(daily_ret.loc[common_idx], spy_returns.loc[common_idx])
-                scores[ticker] = beta
-            else:
-                scores[ticker] = 0
+            # 组合收益流
+            port_ret = returns[tickers].dot(list(weights.values()))
             
-            if "高贝塔" in selected_strategy:
-                ascending_order = False # 越大越弹性
-                col_name = "Beta系数"
-            else:
-                ascending_order = True # 越小越独立
-                col_name = "Beta系数"
-            fmt = "{:.2f}"
+            # --- 核心指标卡片 ---
+            p_cagr, p_vol, p_sharpe, p_mdd = calculate_metrics(port_ret)
+            sp500_cagr, _, _, _ = calculate_metrics(returns['SPY'])
             
-        elif "流动性" in selected_strategy:
-            # 流动性：平均成交金额 (Close * Volume)
-            vol_series = volume_df[ticker].iloc[start_idx:]
-            avg_turnover = (series * vol_series).mean()
-            scores[ticker] = avg_turnover
-            ascending_order = False # 越大越活跃
-            col_name = "日均成交额($)"
-            fmt = "${:,.0f}"
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("年化收益率", f"{p_cagr:.2%}", delta=f"{p_cagr-sp500_cagr:.2%} vs SPY")
+            c2.metric("夏普比率", f"{p_sharpe:.2f}")
+            c3.metric("最大回撤", f"{p_mdd:.2%}")
+            c4.metric("波动率", f"{p_vol:.2%}")
+            
+            st.divider()
+            
+            # --- 图表区 ---
+            col_chart, col_alloc = st.columns([2, 1])
+            
+            with col_chart:
+                st.subheader("📈 收益率走势 (含基准对比)")
+                
+                # 净值计算
+                cum_port = (1 + port_ret).cumprod()
+                cum_spy = (1 + returns['SPY']).cumprod()
+                cum_qqq = (1 + returns['QQQ']).cumprod()
+                
+                fig = go.Figure()
+                
+                # 定义画线函数，包含【需求7：尾端显示数字】
+                def add_line(fig, series, name, color, width=2, dash=None):
+                    fig.add_trace(go.Scatter(
+                        x=series.index, y=series, mode='lines', name=name,
+                        line=dict(color=color, width=width, dash=dash)
+                    ))
+                    # 添加尾端具体的数字 Annotation
+                    last_val = series.iloc[-1]
+                    fig.add_annotation(
+                        x=series.index[-1], y=last_val,
+                        text=f"{last_val:.2f}",
+                        showarrow=True, arrowhead=0, ax=30, ay=0,
+                        font=dict(color=color, size=12, style="bold")
+                    )
 
-        elif "反转" in selected_strategy:
-            # RSI 反转：寻找 RSI 低于 30 的或者最低的
-            rsi = calculate_rsi(series).iloc[-1]
-            scores[ticker] = rsi
-            ascending_order = True # RSI越低越超卖
-            col_name = "当前RSI(14)"
-            fmt = "{:.2f}"
+                add_line(fig, cum_port, "我的组合", "#00CC96", 3)
+                add_line(fig, cum_spy, "S&P 500", "gray", 1, "dot")
+                add_line(fig, cum_qqq, "Nasdaq 100", "#636EFA", 1, "dot")
+                
+                fig.update_layout(
+                    hovermode="x unified", 
+                    margin=dict(r=50), #以此留出空间给右侧数字
+                    height=450,
+                    yaxis_title="净值 (起点=1)"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col_alloc:
+                st.subheader("💰 资产分布")
+                # 计算当前市值
+                latest_prices = close_df.iloc[-1]
+                # 估算相对市值（这里简化为权重*资金，不考虑再平衡的复杂历史）
+                current_vals = {t: capital * w for t, w in weights.items()}
+                
+                df_alloc = pd.DataFrame(list(current_vals.items()), columns=['Ticker', 'Value'])
+                df_alloc['Weight'] = df_alloc['Value'] / df_alloc['Value'].sum()
+                
+                fig_pie = px.pie(df_alloc, values='Value', names='Ticker', hole=0.4)
+                fig_pie.update_traces(textinfo='percent+label')
+                st.plotly_chart(fig_pie, use_container_width=True)
+                
+                st.dataframe(df_alloc.style.format({'Value': "${:,.2f}", 'Weight': "{:.2%}"}), use_container_width=True)
 
-    # --- 排名与筛选 ---
-    scores_series = pd.Series(scores)
-    top_picks = scores_series.sort_values(ascending=ascending_order).head(top_n)
-    winner_tickers = top_picks.index.tolist()
+            # --- [自动补全] 风险相关性分析 ---
+            st.subheader("🔥 风险雷达：持仓相关性矩阵 (Correlation Matrix)")
+            st.caption("颜色越红代表两个资产走势越同步。如果全部是深红色，说明你的分散化做得不够。")
+            corr_matrix = returns[tickers].corr()
+            fig_corr = px.imshow(corr_matrix, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"请检查输入格式。错误详情: {e}")
+
+# ==========================================
+# TAB 2: 量化扫描工厂 (复刻 v5.0 功能)
+# ==========================================
+with tab2:
+    st.header("🧬 策略实验室")
     
-    # --- 仪表盘展示 ---
-    st.title(f"🔍 量化选股报告：{selected_strategy.split(' ')[1]}")
-    
-    # 1. 选股结果表
-    st.subheader(f"🏆 因子选股 Top {top_n}")
-    
-    c1, c2 = st.columns([1, 2])
+    c1, c2 = st.columns([1, 3])
     
     with c1:
-        res_df = pd.DataFrame({'代码': top_picks.index, col_name: top_picks.values})
-        res_df[col_name] = res_df[col_name].apply(lambda x: fmt.format(x))
-        st.table(res_df)
+        st.info("从这里发掘下一个潜力股，添加到 Tab 1 的持仓中。")
+        factor = st.selectbox("选择因子", ["🔥 动量 (涨幅)", "🛡️ 低波 (抗跌)", "💰 流动性 (热度)"])
+        scan_pool_str = st.text_area("扫描池", "AAPL, MSFT, NVDA, TSLA, AMD, GOOG, META, AMZN, NFLX, COIN, MSTR, PLTR, ARM, SMH, SOXL", height=150)
+        lookback = st.slider("回测天数", 30, 365, 90)
+        top_k = st.slider("选出 Top N", 3, 10, 5)
         
-        # 投资建议
-        total_weight = 1.0
-        money = initial_capital * total_weight / top_n
-        st.info(f"💡 建议操作：将 ${initial_capital:,.0f} 平均分配，每只股票买入约 ${money:,.0f}。")
-
-    # 2. 模拟走势图
     with c2:
-        # 归一化对比
-        winner_data = subset[winner_tickers]
-        normalized = winner_data / winner_data.iloc[0]
-        
-        # 组合曲线
-        portfolio_curve = normalized.mean(axis=1)
-        
-        fig = go.Figure()
-        # 个股轻色线
-        for t in winner_tickers:
-            fig.add_trace(go.Scatter(x=normalized.index, y=normalized[t], mode='lines', name=t, opacity=0.3))
-        
-        # 组合重色线
-        fig.add_trace(go.Scatter(x=portfolio_curve.index, y=portfolio_curve, mode='lines', name='优选组合', line=dict(color='#FF4B4B', width=3)))
-        
-        # SPY 基准线
-        if 'SPY' in subset:
-            spy_norm = subset['SPY'] / subset['SPY'].iloc[0]
-            fig.add_trace(go.Scatter(x=spy_norm.index, y=spy_norm, mode='lines', name='标普500 (基准)', line=dict(color='gray', dash='dot')))
-
-        fig.update_layout(title="优选组合 vs 市场基准 (同期走势)", yaxis_title="净值 (起点=1)", height=450)
-        st.plotly_chart(fig, use_container_width=True)
-
-except Exception as e:
-    st.error(f"程序运行出错: {e}")
-    st.markdown("建议：可能是网络问题或股票代码输入有误，请刷新页面重试。")
+        if st.button("开始扫描", key="scan_btn"):
+            scan_tickers = [x.strip().upper() for x in scan_pool_str.split(',') if x.strip()]
+            with st.spinner("正在计算因子..."):
+                s_data = get_data(scan_tickers, period="2y")
+                
+            if s_data is not None:
+                # 数据清洗
+                cls = pd.DataFrame()
+                vol = pd.DataFrame()
+                for t in s_data.columns.levels[0]:
+                    if 'Close' in s_data[t]: cls[t] = s_data[t]['Close']
+                    if 'Volume' in s_data[t]: vol[t] = s_data[t]['Volume']
+                
+                cls = cls.ffill().dropna()
+                
+                # 切片
+                start_idx = -1 * lookback
+                if abs(start_idx) > len(cls): start_idx = 0
+                sub_cls = cls.iloc[start_idx:]
+                
+                scores = {}
+                for t in sub_cls.columns:
+                    if t in ['SPY', 'QQQ']: continue
+                    
+                    if "动量" in factor:
+                        scores[t] = (sub_cls[t].iloc[-1] - sub_cls[t].iloc[0]) / sub_cls[t].iloc[0]
+                        asc = False
+                        col_name = "区间涨幅"
+                    elif "低波" in factor:
+                        scores[t] = sub_cls[t].pct_change().std()
+                        asc = True
+                        col_name = "波动率"
+                    elif "流动性" in factor:
+                        scores[t] = (sub_cls[t] * vol[t].iloc[start_idx:]).mean()
+                        asc = False
+                        col_name = "日均成交额"
+                
+                # 排序
+                res = pd.Series(scores).sort_values(ascending=asc).head(top_k)
+                
+                st.success(f"✅ 筛选完成！以下是表现最好的 {top_k} 只股票：")
+                
+                # 结果可视化
+                r_c1, r_c2 = st.columns([1, 2])
+                with r_c1:
+                    df_res = pd.DataFrame({col_name: res.values}, index=res.index)
+                    if "成交" not in col_name:
+                        df_res[col_name] = df_res[col_name].apply(lambda x: f"{x:.2%}")
+                    else:
+                        df_res[col_name] = df_res[col_name].apply(lambda x: f"${x:,.0f}")
+                    st.table(df_res)
+                    
+                with r_c2:
+                    norm = sub_cls[res.index] / sub_cls[res.index].iloc[0]
+                    fig_scan = go.Figure()
+                    for t in res.index:
+                        fig_scan.add_trace(go.Scatter(x=norm.index, y=norm[t], name=t))
+                    fig_scan.update_layout(height=300, margin=dict(t=0, b=0, l=0, r=0), yaxis_title="归一化走势")
+                    st.plotly_chart(fig_scan, use_container_width=True)
